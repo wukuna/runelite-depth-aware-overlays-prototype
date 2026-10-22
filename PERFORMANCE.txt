@@ -1,0 +1,79 @@
+ISOLATED GPU PROTOTYPE V4 - PERFORMANCE REVIEW, 2026-10-22
+
+Source-only review publication. No runnable client binaries or account launchers are distributed.
+
+Implemented
+- Skip selective depth allocation/clear/replay when no labels exist; skip object
+  classification refresh in that case. Ground-item discovery still runs.
+- Batch visible static landscape range intersections into glMultiDrawArrays,
+  bounded reusable buffers of 1024 ranges; flush safely at capacity.
+- Preserve original roof/visibility range intersections and object classification.
+- Core-only replay path uses documented known scene state and explicit original
+  depth-write setting, restoring framebuffer/color mask/uniform/depth mask in finally.
+  The generic state-preserving path remains available separately.
+- Cache label shader uniform locations. Reuse raster/pixel upload buffers and
+  font, reuse evicted texture objects, remove sample-offset array allocations.
+- Keep original scene depth untouched and the player in its original scene pass.
+
+Measurements: NVIDIA RTX 3070 Ti Laptop GPU, Java 11, hidden OpenGL context,
+1920x1080 render target. CPU wall submission time and GPU timer-query elapsed time
+are separate observations; DO NOT add them. Driver stalls and concurrent workload
+can affect results. These are synthetic benchmarks, not live game frame costs.
+30 warm-up / 80 measured frames per steady scenario; churn 5 / 30 frames.
+
+Selected median CPU / GPU milliseconds:
+                                  V3            V4
+64 labels, 500 separate small
+replays, 4x MSAA                3.267 / 5.175   3.259 / 5.695
+64 new labels/frame, 100 small
+replays, no MSAA                8.460 / 9.585   4.569 / 4.995
+64 labels, 500 fullscreen
+replays, 4x MSAA                3.57 / 16.60    3.553 / 17.497
+
+These results DO NOT establish an improvement in unbatched geometry cost. The
+texture-churn CPU median improved approximately 46%, but remains material.
+
+V4 batched microbenchmark: same 500 small triangles in ONE geometry submission,
+64 cached labels, 4x MSAA: CPU median 0.0825 ms (p95 0.1630), GPU median 0.1843 ms
+(p95 0.1874). This demonstrates batching potential; it is NOT a measurement of
+500 independent game objects. Different transforms, zones and alpha ordering
+still require separate submissions. The real Zone implementation batches eligible
+range intersections per zone, not the whole scene in one draw.
+V4 64 cached labels without geometry replay: approximately 0.06 ms CPU,
+0.025-0.030 ms GPU. Zero-label synthetic passes approximately 0.001 ms; this
+excludes client-thread discovery and pre-existing range bookkeeping.
+
+Bounds and limitations
+64 labels maximum, one per pile, within 12 tiles; current selection is scan order,
+not relevance-ranked. 256-input benchmark is capped to 64 and is NOT 256 rendered
+labels. 128 cached textures, max 480x22 RGBA each (~5.2 MiB payload upper bound).
+Additional depth32F attachment: ~7.9 MiB at 1080p, ~31.6 MiB at 4x MSAA; ~126.6 MiB
+at 4K/4x. Driver overhead excluded. Geometry metadata grows with loaded scene
+geometry; it is not a fixed-size cache. Extra replay fill rate remains a risk.
+No depth readback is performed in the actual renderer; benchmark readbacks/timers
+are test-only. Automatic clearance is bounded to 64 additional world units and
+samples a local ground patch; it can still clip at extreme camera angles.
+Classification heuristics/overrides need further review. Semitransparent blockers,
+bridges/roofs, sub-worlds, HiDPI/stretched layouts, and other renderers need coverage.
+No live allocation/whole-client profile or lower-end GPU measurements were taken.
+No claim of universal optimality or production readiness is justified.
+
+Verification
+Regression graphics tests passed with 0/4x MSAA: landscape/player occlusion,
+props not occluding, original scene color/depth preserved, ordinary subsequent
+UI drawing, lifecycle recreation, and exceptional fast-path state restoration.
+Ground-clearance and classification tests passed. Final packaged build is local.
+
+
+Next optimization decisions for maintainers
+Consider a shared renderer-owned label atlas/instanced quads, screen-region-limited
+selective depth, dedicated depth-only shader, and a renderer-supported classification
+contract. Do not promise those as implemented. Profile real scenes before choosing
+between selective geometry replay and an additional semantic depth attachment.
+
+Evidence: performance-probe-v3.csv, performance-probe-small-v3.csv,
+performance-probe.csv, performance-probe-small.csv, performance-probe-batched.csv.
+Batched CSV replay_calls denotes input ranges, grouped into one replay. No-label
+rows skip replay altogether. Fullscreen stress deliberately exaggerates overdraw.
+The latest probe shader also retains a branch uniform for testing state restoration;
+comparison is indicative rather than a controlled same-session A/B experiment.

@@ -1,0 +1,1021 @@
+--- /dev/null
++++ b/runelite-client/src/main/java/net/runelite/client/plugins/gpu/DepthLabelPass.java
+@@ -0,0 +1,297 @@
++package net.runelite.client.plugins.gpu;
++
++import java.awt.Color;
++import java.awt.Font;
++import java.awt.Graphics2D;
++import java.awt.image.BufferedImage;
++import java.nio.ByteBuffer;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import net.runelite.api.Client;
++import net.runelite.api.GameState;
++import net.runelite.api.Perspective;
++import net.runelite.api.Tile;
++import net.runelite.api.TileItem;
++import net.runelite.api.WorldView;
++import net.runelite.api.coords.LocalPoint;
++import org.lwjgl.BufferUtils;
++import static org.lwjgl.opengl.GL33C.*;
++
++/** Local renderer experiment. Never installed as a Hub or sideload plugin. */
++final class DepthLabelPass
++{
++    static final int MAX_LABELS = 64;
++    static final int MAX_TEXTURES = 128;
++    private int program, vao;
++    private int projectionUniform, viewportUniform, imageUniform, anchorUniform, sizeUniform;
++    private final BufferedImage raster = new BufferedImage(480, 22, BufferedImage.TYPE_INT_ARGB);
++    private final ByteBuffer upload = BufferUtils.createByteBuffer(480 * 22 * 4);
++    private static final Font LABEL_FONT = new Font(Font.SANS_SERIF, Font.BOLD, 12);
++
++    boolean hasLabels() { return !labels.isEmpty(); }
++
++    private final Map<String, Texture> textures = new LinkedHashMap<>(128, .75f, true);
++    private volatile List<Label> labels = Collections.emptyList();
++
++    static final class Label
++    {
++        final String text;
++        final float x, y, z;
++        final float[] ground;
++        Label(String text, float x, float y, float z)
++        {
++            this(text, x, y, z, null);
++        }
++        Label(String text, float x, float y, float z, float[] ground)
++        {
++            this.text = text; this.x = x; this.y = y; this.z = z;
++            this.ground = ground;
++        }
++    }
++
++    private static final class Texture
++    {
++        final int id, width, height;
++        Texture(int id, int width, int height)
++        {
++            this.id = id; this.width = width; this.height = height;
++        }
++    }
++
++    // Snapshot on the client thread. No game state is read by the GL draw pass.
++    void collect(Client client, int labelHeight, boolean automaticClearance)
++    {
++        labels = Collections.emptyList();
++        WorldView world = client.getTopLevelWorldView();
++        if (client.getGameState() != GameState.LOGGED_IN || world == null
++            || client.getLocalPlayer() == null
++            || client.getLocalPlayer().getWorldView() != world)
++        {
++            return;
++        }
++        LocalPoint player = client.getLocalPlayer().getLocalLocation();
++        Tile[][] tiles = world.getScene().getTiles()[world.getPlane()];
++        List<Label> next = new ArrayList<>();
++        int px = player.getSceneX(), py = player.getSceneY();
++        for (int x = Math.max(0, px - 12); x <= Math.min(tiles.length - 1, px + 12); x++)
++        {
++            for (int y = Math.max(0, py - 12); y <= Math.min(tiles[x].length - 1, py + 12); y++)
++            {
++                Tile tile = tiles[x][y];
++                if (tile == null || next.size() >= MAX_LABELS) { continue; }
++                List<TileItem> items = tile.getGroundItems();
++                if (items == null || items.isEmpty()) { continue; }
++                String name = client.getItemDefinition(items.get(0).getId()).getName();
++                if (items.size() > 1) { name += " +" + (items.size() - 1); }
++                LocalPoint point = tile.getLocalLocation();
++                // One billboard per pile above the sampled ground surface.
++                int height = Perspective.getTileHeight(client, point, world.getPlane())
++                    - Math.max(1, Math.min(150, labelHeight));
++                float[] ground = null;
++                if (automaticClearance)
++                {
++                    // A small patch within this item's tile, not neighboring hills or objects.
++                    ground = new float[27];
++                    int index = 0;
++                    for (int dx = -24; dx <= 24; dx += 24)
++                    {
++                        for (int dz = -24; dz <= 24; dz += 24)
++                        {
++                            LocalPoint sample = new LocalPoint(point.getX()+dx, point.getY()+dz, world);
++                            ground[index++] = sample.getX();
++                            ground[index++] = Perspective.getTileHeight(client, sample, world.getPlane());
++                            ground[index++] = sample.getY();
++                        }
++                    }
++                }
++                next.add(new Label("TEST: " + name, point.getX(), height, point.getY(), ground));
++            }
++        }
++        labels = Collections.unmodifiableList(next);
++    }
++
++    void render(float[] projection, int width, int height)
++    {
++        render(projection, width, height, labels);
++    }
++
++    void render(float[] projection, int width, int height, List<Label> commands)
++    {
++        if (commands.isEmpty() || width <= 0 || height <= 0) { return; }
++        // No FBO changes, clears, scene redraw, depth readback or depth writes.
++        try (State ignored = new State())
++        {
++            if (program == 0) { initialize(); }
++            glUseProgram(program);
++            glBindVertexArray(vao);
++            glActiveTexture(GL_TEXTURE0);
++            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
++            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
++            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
++            glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
++            glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
++            glEnable(GL_DEPTH_TEST);
++            glDepthFunc(GL_GREATER); // RuneLite's reversed-Z projection.
++            glDepthMask(false);
++            glDisable(GL_CULL_FACE);
++            glEnable(GL_BLEND);
++            glBlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
++            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
++            glUniformMatrix4fv(projectionUniform, false, projection);
++            glUniform2f(viewportUniform, width, height);
++            glUniform1i(imageUniform, 0);
++            for (Label label : commands.subList(0, Math.min(MAX_LABELS, commands.size())))
++            {
++                Texture texture = texture(label.text);
++                glBindTexture(GL_TEXTURE_2D, texture.id);
++                float lift = GroundClearance.lift(projection, label.x, label.y, label.z,
++                    label.ground, height, texture.height);
++                glUniform3f(anchorUniform, label.x, label.y - lift, label.z);
++                glUniform2f(sizeUniform, texture.width, texture.height);
++                glDrawArrays(GL_TRIANGLES, 0, 6);
++            }
++        }
++    }
++
++    private void initialize()
++    {
++        int vertex = 0, fragment = 0, candidate = 0;
++        try
++        {
++            vertex = shader(GL_VERTEX_SHADER,
++                "#version 330\n"
++                + "uniform mat4 projection; uniform vec3 anchor; uniform vec2 viewport, size; out vec2 uv;\n"
++                + "const vec2 corners[6]=vec2[6](vec2(0,0),vec2(1,0),vec2(1,1),vec2(0,0),vec2(1,1),vec2(0,1));\n"
++                + "void main(){ uv=corners[gl_VertexID]; vec4 p=projection*vec4(anchor,1);"
++                + "p.xy+=(uv-vec2(.5))*vec2(1,-1)*size*2.0/viewport*p.w; gl_Position=p; }\n");
++            fragment = shader(GL_FRAGMENT_SHADER,
++                "#version 330\nuniform sampler2D image; in vec2 uv; out vec4 color;\n"
++                + "void main(){ color=texture(image,uv); if(color.a<0.01) discard; }\n");
++            candidate = glCreateProgram();
++            glAttachShader(candidate, vertex); glAttachShader(candidate, fragment);
++            glLinkProgram(candidate);
++            if (glGetProgrami(candidate, GL_LINK_STATUS) == GL_FALSE)
++            { throw new IllegalStateException(glGetProgramInfoLog(candidate)); }
++            vao = glGenVertexArrays();
++            program = candidate;
++            projectionUniform = glGetUniformLocation(program, "projection");
++            viewportUniform = glGetUniformLocation(program, "viewport");
++            imageUniform = glGetUniformLocation(program, "image");
++            anchorUniform = glGetUniformLocation(program, "anchor");
++            sizeUniform = glGetUniformLocation(program, "size");
++
++            candidate = 0;
++        }
++        finally
++        {
++            if (candidate != 0) { glDeleteProgram(candidate); }
++            if (vertex != 0) { glDeleteShader(vertex); }
++            if (fragment != 0) { glDeleteShader(fragment); }
++        }
++    }
++
++    private static int shader(int type, String source)
++    {
++        int shader = glCreateShader(type);
++        glShaderSource(shader, source); glCompileShader(shader);
++        if (glGetShaderi(shader, GL_COMPILE_STATUS) == GL_FALSE)
++        {
++            String error = glGetShaderInfoLog(shader);
++            glDeleteShader(shader);
++            throw new IllegalStateException(error);
++        }
++        return shader;
++    }
++
++    private Texture texture(String text)
++    {
++        // Bound both text size and GPU allocations even during repeated region changes.
++        String key = text.substring(0, Math.min(text.length(), 70));
++        Texture cached = textures.get(key);
++        if (cached != null) { return cached; }
++        BufferedImage image = raster;
++        Graphics2D graphics = image.createGraphics();
++        int width;
++        try
++        {
++            graphics.setFont(LABEL_FONT);
++            graphics.setComposite(java.awt.AlphaComposite.Src);
++            width = Math.min(480, graphics.getFontMetrics().stringWidth(key) + 12);
++            graphics.setColor(new Color(10, 15, 22, 220)); graphics.fillRect(0, 0, width, 22);
++            graphics.setColor(Color.CYAN); graphics.drawRect(0, 0, width - 1, 21);
++            graphics.drawString(key, 6, 16);
++        }
++        finally { graphics.dispose(); }
++        ByteBuffer bytes = upload; bytes.clear();
++        int[] pixels = ((java.awt.image.DataBufferInt)image.getRaster().getDataBuffer()).getData();
++        for (int y = 0; y < 22; y++)
++        {
++            for (int x = 0; x < width; x++)
++            {
++                int argb = pixels[y * 480 + x];
++                bytes.put((byte)(argb >> 16)).put((byte)(argb >> 8)).put((byte)argb).put((byte)(argb >> 24));
++            }
++        }
++        bytes.flip();
++        int id;
++        if (textures.size() >= MAX_TEXTURES)
++        {
++            String eldest = textures.keySet().iterator().next();
++            id = textures.remove(eldest).id;
++        }
++        else { id = glGenTextures(); }
++        glBindTexture(GL_TEXTURE_2D, id);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, 22, 0, GL_RGBA, GL_UNSIGNED_BYTE, bytes);
++        Texture result = new Texture(id, width, 22);
++        textures.put(key, result);
++        return result;
++    }
++
++    void close()
++    {
++        for (Texture texture : textures.values()) { glDeleteTextures(texture.id); }
++        textures.clear();
++        if (vao != 0) { glDeleteVertexArrays(vao); vao = 0; }
++        if (program != 0) { glDeleteProgram(program); program = 0; }
++        labels = Collections.emptyList();
++    }
++
++    /** Restore every GL state changed by this pass, including first-use texture upload. */
++    private static final class State implements AutoCloseable
++    {
++        final int program = glGetInteger(GL_CURRENT_PROGRAM), vao = glGetInteger(GL_VERTEX_ARRAY_BINDING);
++        final int active = glGetInteger(GL_ACTIVE_TEXTURE), unpack = glGetInteger(GL_PIXEL_UNPACK_BUFFER_BINDING);
++        final int alignment = glGetInteger(GL_UNPACK_ALIGNMENT), row = glGetInteger(GL_UNPACK_ROW_LENGTH);
++        final int skipX = glGetInteger(GL_UNPACK_SKIP_PIXELS), skipY = glGetInteger(GL_UNPACK_SKIP_ROWS);
++        final int depth = glGetInteger(GL_DEPTH_FUNC), srcRGB = glGetInteger(GL_BLEND_SRC_RGB);
++        final int dstRGB = glGetInteger(GL_BLEND_DST_RGB), srcA = glGetInteger(GL_BLEND_SRC_ALPHA);
++        final int dstA = glGetInteger(GL_BLEND_DST_ALPHA), eqRGB = glGetInteger(GL_BLEND_EQUATION_RGB);
++        final int eqA = glGetInteger(GL_BLEND_EQUATION_ALPHA);
++        final boolean depthTest = glIsEnabled(GL_DEPTH_TEST), cull = glIsEnabled(GL_CULL_FACE);
++        final boolean blend = glIsEnabled(GL_BLEND), write = glGetBoolean(GL_DEPTH_WRITEMASK);
++        final int texture;
++        State()
++        {
++            glActiveTexture(GL_TEXTURE0); texture = glGetInteger(GL_TEXTURE_BINDING_2D);
++        }
++        public void close()
++        {
++            glUseProgram(program); glBindVertexArray(vao);
++            glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, texture); glActiveTexture(active);
++            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, unpack);
++            glPixelStorei(GL_UNPACK_ALIGNMENT, alignment); glPixelStorei(GL_UNPACK_ROW_LENGTH, row);
++            glPixelStorei(GL_UNPACK_SKIP_PIXELS, skipX); glPixelStorei(GL_UNPACK_SKIP_ROWS, skipY);
++            glDepthFunc(depth); glDepthMask(write);
++            glBlendEquationSeparate(eqRGB, eqA); glBlendFuncSeparate(srcRGB, dstRGB, srcA, dstA);
++            set(GL_DEPTH_TEST, depthTest); set(GL_CULL_FACE, cull); set(GL_BLEND, blend);
++        }
++        private static void set(int key, boolean value) { if (value) { glEnable(key); } else { glDisable(key); } }
++    }
++}
+--- a/runelite-client/src/main/java/net/runelite/client/plugins/gpu/GpuPlugin.java
++++ b/runelite-client/src/main/java/net/runelite/client/plugins/gpu/GpuPlugin.java
+@@ -91,7 +91,8 @@
+ import org.lwjgl.system.Configuration;
+ 
+ @PluginDescriptor(
+-	name = "GPU",
++	name = "GPU Depth Labels TEST",
++	configName = "gpu",
+ 	description = "Offloads rendering to GPU",
+ 	tags = {"fog", "draw distance"},
+ 	loadInSafeMode = false
+@@ -133,6 +134,8 @@
+ 	@Inject
+ 	private RenderCallbackManager renderCallbackManager;
+ 
++	private final DepthLabelPass depthLabels = new DepthLabelPass();
++	private float[] depthLabelProjection;
+ 	private Canvas canvas;
+ 	private AWTContext awtContext;
+ 	private Callback debugCallback;
+@@ -452,6 +455,9 @@
+ 
+ 			if (lwjglInitted)
+ 			{
++				depthLabels.close();
++				SelectiveDepth.INSTANCE.close();
++				depthLabelProjection = null;
+ 				if (textureArrayId != -1)
+ 				{
+ 					textureManager.freeTextureArray(textureArrayId);
+@@ -817,6 +823,7 @@
+ 
+ 	private void shutdownFbo()
+ 	{
++		SelectiveDepth.INSTANCE.close();
+ 		if (fboScene != -1)
+ 		{
+ 			glDeleteFramebuffers(fboScene);
+@@ -1007,6 +1014,7 @@
+ 		Mat4.mul(projectionMatrix, Mat4.rotateY(cameraYaw));
+ 		Mat4.mul(projectionMatrix, Mat4.translate(-cameraX, -cameraY, -cameraZ));
+ 		glUniformMatrix4fv(uniWorldProj, false, projectionMatrix);
++		depthLabelProjection = projectionMatrix;
+ 
+ 		glUniformMatrix4fv(uniEntityProj, false, IDENTITY);
+ 
+@@ -1027,7 +1035,15 @@
+ 		glDepthFunc(GL_GREATER);
+ 		glEnable(GL_DEPTH_TEST);
+ 
++		SelectiveDepth.INSTANCE.active = false;
+ 		drawSkybox(scene, sky, cameraX, cameraY, cameraZ);
++		try { SelectiveDepth.INSTANCE.begin(Boolean.getBoolean("runelite.depthLabelsTest") && config.testDepthLabels() && depthLabels.hasLabels()); }
++		catch (RuntimeException ex)
++		{
++			log.error("TEST selective depth disabled after initialization failure", ex);
++			System.setProperty("runelite.depthLabelsTest", "false");
++			SelectiveDepth.INSTANCE.close();
++		}
+ 
+ 		checkGLErrors();
+ 	}
+@@ -1077,6 +1093,18 @@
+ 
+ 	private void postDrawToplevel()
+ 	{
++		if (Boolean.getBoolean("runelite.depthLabelsTest") && config.testDepthLabels() && depthLabelProjection != null)
++		{
++			try
++			{
++				SelectiveDepth.INSTANCE.labels(() -> depthLabels.render(depthLabelProjection, client.getViewportWidth(), client.getViewportHeight()));
++			}
++			catch (RuntimeException ex)
++			{
++				log.error("TEST depth labels disabled after rendering failure", ex);
++				System.setProperty("runelite.depthLabelsTest", "false");
++			}
++		}
+ 		glDisable(GL_BLEND);
+ 		glDisable(GL_CULL_FACE);
+ 		glDisable(GL_DEPTH_TEST);
+@@ -1237,7 +1265,7 @@
+ 
+ 			rt.modelUploader.uploadTempModel(m, orient, x, y, z,
+ 				ctx.cameraX, ctx.cameraY, ctx.cameraZ, o.vbo.vb);
+-			o.addRange(ctx.projection, scene, 0);
++			o.addRange(ctx.projection, scene, 0, tileObject.getId());
+ 		}
+ 		else
+ 		{
+@@ -1265,7 +1293,7 @@
+ 			}
+ 			int end = a.vbo.vb.position();
+ 
+-			o.addRange(ctx.projection, scene, 0);
++			o.addRange(ctx.projection, scene, 0, tileObject.getId());
+ 
+ 			if (end > start)
+ 			{
+@@ -1278,7 +1306,7 @@
+ 				// tileObject.getPlane()>maxLevel if visbelow is set - lower the object to the max level
+ 				int plane = Math.min(ctx.maxLevel, tileObject.getPlane());
+ 				// renderable modelheight is typically not set here because DynamicObject doesn't compute it on the returned model
+-				zone.addTempAlphaModel(a.vao, start, end, plane, x & 1023, y, z & 1023);
++				zone.addTempAlphaModel(a.vao, start, end, plane, x & 1023, y, z & 1023, tileObject.getId());
+ 			}
+ 		}
+ 	}
+@@ -1298,6 +1326,7 @@
+ 		}
+ 
+ 		Renderable renderable = gameObject.getRenderable();
++		int labelId = renderable instanceof net.runelite.api.Player ? LabelOccluders.PLAYER : LabelOccluders.IGNORE;
+ 		int size = m.getFaceCount() * 3 * VAO.VERT_SIZE;
+ 		int renderMode = renderable.getRenderMode();
+ 		if (renderMode == Renderable.RENDERMODE_SORTED_NO_DEPTH || m.getFaceTransparencies() != null || m.getTransparency() != 0)
+@@ -1321,7 +1350,7 @@
+ 			}
+ 			int end = a.vbo.vb.position();
+ 
+-			o.addRange(ctx.projection, scene, renderMode == Renderable.RENDERMODE_SORTED_NO_DEPTH ? renderMode : 0);
++			o.addRange(ctx.projection, scene, renderMode == Renderable.RENDERMODE_SORTED_NO_DEPTH ? renderMode : 0, labelId);
+ 
+ 			if (end > start)
+ 			{
+@@ -1330,7 +1359,7 @@
+ 				int zz = (gameObject.getY() >> 10) + offset;
+ 				Zone zone = ctx.zones[zx][zz];
+ 				int plane = Math.min(ctx.maxLevel, gameObject.getPlane());
+-				zone.addTempAlphaModel(a.vao, start, end, plane, x & 1023, y - renderable.getModelHeight() /* to render players over locs */, z & 1023);
++				zone.addTempAlphaModel(a.vao, start, end, plane, x & 1023, y - renderable.getModelHeight() /* to render players over locs */, z & 1023, labelId);
+ 			}
+ 		}
+ 		else
+@@ -1340,7 +1369,7 @@
+ 			ModelUploader uploader = rt.modelUploader;
+ 			uploader.uploadTempModel(m, orient, x, y, z,
+ 				ctx.cameraX, ctx.cameraY, ctx.cameraZ, o.vbo.vb);
+-			o.addRange(ctx.projection, scene, 0);
++			o.addRange(ctx.projection, scene, 0, labelId);
+ 		}
+ 	}
+ 
+@@ -1364,6 +1393,11 @@
+ 	@Subscribe
+ 	public void onPostClientTick(PostClientTick event)
+ 	{
++		if (Boolean.getBoolean("runelite.depthLabelsTest") && config.testDepthLabels())
++		{
++			depthLabels.collect(client, config.testLabelHeight(), config.testAutoClearance());
++			if (depthLabels.hasLabels()) { LabelOccluders.INSTANCE.refresh(client, config); }
++		}
+ 		WorldView wv = client.getTopLevelWorldView();
+ 		if (wv == null)
+ 		{
+@@ -2202,6 +2236,20 @@
+ 	}
+ 
+ 	@Subscribe
++	public void onMenuEntryAdded(net.runelite.api.events.MenuEntryAdded event)
++	{
++		if (!Boolean.getBoolean("runelite.depthLabelsTest") || !config.testObjectIds()) { return; }
++		net.runelite.api.MenuEntry entry = event.getMenuEntry();
++		String action = entry.getType().name();
++		if (!action.startsWith("GAME_OBJECT_") && !action.equals("EXAMINE_OBJECT")) { return; }
++		int id = entry.getIdentifier();
++		LabelOccluders.INSTANCE.resolve(client, id);
++		LabelOccluders.INSTANCE.configure(config.testLandscapeIds(), config.testPropIds());
++		entry.setTarget(entry.getTarget() + " <col=00ffff>[" + id + ": "
++			+ (LabelOccluders.INSTANCE.blocks(id) ? "blocks" : "prop") + "]</col>");
++	}
++
++	@Subscribe
+ 	private void onCommandExecuted(CommandExecuted event)
+ 	{
+ 		if (event.getCommand().equals("gpumem"))
+--- a/runelite-client/src/main/java/net/runelite/client/plugins/gpu/GpuPluginConfig.java
++++ b/runelite-client/src/main/java/net/runelite/client/plugins/gpu/GpuPluginConfig.java
+@@ -38,6 +38,25 @@
+ public interface GpuPluginConfig extends Config
+ {
+ 	String GROUP = "gpu";
++	@ConfigItem(keyName="testAutoClearance", name="TEST automatic ground clearance", description="Raise labels just enough above the item's local ground patch, capped at 64 extra world units. Foreground walls and hills still depth-test normally.", position=-6)
++	default boolean testAutoClearance() { return true; }
++	@ConfigItem(keyName="testLandscapeIds", name="TEST landscape IDs", description="Comma-separated object IDs that block labels. Wins conflicts with prop IDs. Changes apply without reloading the scene.", position=-5)
++	default String testLandscapeIds() { return ""; }
++	@ConfigItem(keyName="testPropIds", name="TEST prop IDs", description="Comma-separated object IDs that never block labels. Use IDs shown in object menus.", position=-4)
++	default String testPropIds() { return ""; }
++	@ConfigItem(keyName="testObjectIds", name="TEST show object IDs", description="Show object IDs and label classification in right-click menus in this isolated client.", position=-3)
++	default boolean testObjectIds() { return true; }
++
++
++	@ConfigItem(keyName = "testDepthLabels", name = "TEST ground labels",
++		description = "Local prototype: depth-tested ground-item labels. Disable to compare normal rendering.", position = -2)
++	default boolean testDepthLabels() { return true; }
++
++	@Range(min = 1, max = 150)
++	@ConfigItem(keyName = "testLabelHeight", name = "TEST label height",
++		description = "World units above the ground; affects which terrain and models cover labels.", position = -1)
++	default int testLabelHeight() { return 24; }
++
+ 
+ 	@Range(
+ 		max = MAX_DISTANCE
+--- /dev/null
++++ b/runelite-client/src/main/java/net/runelite/client/plugins/gpu/GroundClearance.java
+@@ -0,0 +1,46 @@
++package net.runelite.client.plugins.gpu;
++
++/** Bounded placement based only on ground immediately around the item, never scene occluders. */
++final class GroundClearance
++{
++    static final float MAX_LIFT = 64;
++
++    static float lift(float[] matrix, float x, float y, float z, float[] ground,
++                      int viewportHeight, int labelHeight)
++    {
++        if (ground == null || viewportHeight <= 0) { return 0; }
++        float baseline = screenY(matrix, x, y, z, viewportHeight);
++        if (!Float.isFinite(baseline)) { return 0; }
++        float limit = Float.POSITIVE_INFINITY;
++        for (int i = 0; i + 2 < ground.length; i += 3)
++        {
++            float pixel = screenY(matrix, ground[i], ground[i+1], ground[i+2], viewportHeight);
++            if (Float.isFinite(pixel)) { limit = Math.min(limit, pixel); }
++        }
++        if (!Float.isFinite(limit)) { return 0; }
++        float target = limit - labelHeight * .5f - 2;
++        if (baseline <= target) { return 0; }
++        float highest = screenY(matrix, x, y - MAX_LIFT, z, viewportHeight);
++        // At extreme pitch, moving upward may not move the label up-screen. Do not jump.
++        if (!Float.isFinite(highest) || highest >= baseline) { return 0; }
++        if (highest > target) { return MAX_LIFT; }
++        float low = 0, high = MAX_LIFT;
++        for (int i = 0; i < 12; i++)
++        {
++            float mid = (low + high) * .5f;
++            float pixel = screenY(matrix, x, y - mid, z, viewportHeight);
++            if (!Float.isFinite(pixel) || pixel > target) { low = mid; }
++            else { high = mid; }
++        }
++        return high;
++    }
++
++    private static float screenY(float[] m, float x, float y, float z, int height)
++    {
++        float w = m[3]*x + m[7]*y + m[11]*z + m[15];
++        // RuneLite's near plane is 50; do not extrapolate anchors through the camera.
++        if (!Float.isFinite(w) || w < 50) { return Float.NaN; }
++        float cy = m[1]*x + m[5]*y + m[9]*z + m[13];
++        return (1 - cy/w) * height * .5f;
++    }
++}
+--- /dev/null
++++ b/runelite-client/src/main/java/net/runelite/client/plugins/gpu/LabelOccluders.java
+@@ -0,0 +1,101 @@
++package net.runelite.client.plugins.gpu;
++
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Locale;
++import java.util.Map;
++import java.util.Set;
++import java.util.regex.Pattern;
++import net.runelite.api.Client;
++import net.runelite.api.ObjectComposition;
++import net.runelite.api.Tile;
++import net.runelite.api.TileObject;
++import net.runelite.api.WorldView;
++
++/** Classification is client-thread-owned. Render workers store IDs, never query definitions. */
++final class LabelOccluders
++{
++    static final int TERRAIN = -1, PLAYER = -2, IGNORE = -3;
++    static final LabelOccluders INSTANCE = new LabelOccluders();
++    private static final Pattern PROPS = Pattern.compile("\\b(chest|chests|crate|crates|barrel|barrels|chair|chairs|stool|stools|table|tables|bench|benches|cupboard|wardrobe|bookcase|drawers|sack|sacks|coffer)\\b");
++    private final Map<Integer, Boolean> known = new HashMap<>();
++    private Set<Integer> landscape = new HashSet<>(), props = new HashSet<>();
++    private String previousLandscape = "", previousProps = "";
++    private long nextScan;
++
++    static Set<Integer> parseIds(String text)
++    {
++        Set<Integer> result = new HashSet<>();
++        for (String value : text.trim().split("[,\\s]+"))
++        {
++            if (value.isEmpty()) { continue; }
++            try { int id = Integer.parseInt(value); if (id >= 0) { result.add(id); } }
++            catch (NumberFormatException ignored) { /* Invalid tokens never turn objects into props. */ }
++        }
++        return result;
++    }
++
++    static boolean defaultBlocks(String name)
++    {
++        return name == null || !PROPS.matcher(name.toLowerCase(Locale.ROOT)).find();
++    }
++
++    boolean blocks(int id)
++    {
++        if (id == TERRAIN || id == PLAYER) { return true; }
++        if (id == IGNORE) { return false; }
++        if (landscape.contains(id)) { return true; } // Blocking wins conflicting overrides.
++        if (props.contains(id)) { return false; }
++        return known.getOrDefault(id, true);
++    }
++
++    void configure(String landscapeIds, String propIds)
++    {
++        if (!landscapeIds.equals(previousLandscape) || !propIds.equals(previousProps))
++        {
++            landscape = parseIds(landscapeIds); props = parseIds(propIds);
++            previousLandscape = landscapeIds; previousProps = propIds;
++        }
++    }
++
++    void resolve(Client client, int id)
++    {
++        if (id < 0) { return; }
++        ObjectComposition definition = client.getObjectDefinition(id);
++        if (definition == null) { return; }
++        if (definition.getImpostorIds() != null) { definition = definition.getImpostor(); }
++        known.put(id, definition == null || defaultBlocks(definition.getName()));
++    }
++
++    void refresh(Client client, GpuPluginConfig config)
++    {
++        configure(config.testLandscapeIds(), config.testPropIds());
++        long now = System.nanoTime();
++        if (now < nextScan) { return; }
++        nextScan = now + 500_000_000L;
++        WorldView world = client.getTopLevelWorldView();
++        if (world == null) { known.clear(); return; }
++        // Resolve scene IDs on the client thread. Revisit transformations (e.g. open chests).
++        Set<Integer> seen = new HashSet<>();
++        for (Tile[][] plane : world.getScene().getExtendedTiles())
++        {
++            for (Tile[] row : plane)
++            {
++                for (Tile tile : row)
++                {
++                    if (tile == null) { continue; }
++                    visit(client, tile.getWallObject(), seen);
++                    visit(client, tile.getDecorativeObject(), seen);
++                    visit(client, tile.getGroundObject(), seen);
++                    for (TileObject object : tile.getGameObjects()) { visit(client, object, seen); }
++                }
++            }
++        }
++        known.keySet().retainAll(seen);
++    }
++
++    private void visit(Client client, TileObject object, Set<Integer> seen)
++    {
++        if (object != null && seen.add(object.getId())) { resolve(client, object.getId()); }
++    }
++}
+--- a/runelite-client/src/main/java/net/runelite/client/plugins/gpu/SceneUploader.java
++++ b/runelite-client/src/main/java/net/runelite/client/plugins/gpu/SceneUploader.java
+@@ -88,6 +88,7 @@
+ 
+ 	void uploadZone(Scene scene, Zone zone, int mzx, int mzz)
+ 	{
++		zone.labelRanges.clear();
+ 		int[][][] roofs = scene.getRoofs();
+ 		Set<Integer> roofIds = new HashSet<>();
+ 
+@@ -278,6 +279,7 @@
+ 	private int uploadZoneTile(Scene scene, Zone zone, Tile t, GpuIntBuffer vertexBuffer, GpuIntBuffer ab)
+ 	{
+ 		int len = 0;
++		int terrainStart = vertexBuffer == null ? 0 : vertexBuffer.getBuffer().position();
+ 		boolean drawTile = renderCallbackManager.drawTile(scene, t);
+ 
+ 		SceneTilePaint paint = t.getSceneTilePaint();
+@@ -298,6 +300,7 @@
+ 			len += upload(model, tilePoint.getX() << 7, tilePoint.getY() << 7, vertexBuffer);
+ 		}
+ 
++		if (vertexBuffer != null) { zone.labelRange(terrainStart, vertexBuffer.getBuffer().position(), LabelOccluders.TERRAIN); }
+ 		WallObject wallObject = t.getWallObject();
+ 		if (wallObject != null && renderCallbackManager.drawObject(scene, wallObject))
+ 		{
+@@ -403,6 +406,7 @@
+ 
+ 	private void uploadZoneRenderable(Renderable r, Zone zone, int orient, int x, int y, int z, int lx, int lz, int ux, int uz, int id, GpuIntBuffer vb, GpuIntBuffer ab)
+ 	{
++		int labelStart = vb == null ? 0 : vb.getBuffer().position();
+ 		int pos = zone.vboA != null ? zone.vboA.vb.position() : 0;
+ 		Model model = null;
+ 		if (r instanceof Model)
+@@ -418,6 +422,7 @@
+ 				uploadStaticModel(model, orient, x - basex, y, z - basez, vb, ab);
+ 			}
+ 		}
++		if (vb != null) { zone.labelRange(labelStart, vb.getBuffer().position(), id); }
+ 		int endpos = zone.vboA != null ? zone.vboA.vb.position() : 0;
+ 		if (endpos > pos)
+ 		{
+--- /dev/null
++++ b/runelite-client/src/main/java/net/runelite/client/plugins/gpu/SelectiveDepth.java
+@@ -0,0 +1,127 @@
++package net.runelite.client.plugins.gpu;
++
++import java.nio.ByteBuffer;
++import org.lwjgl.BufferUtils;
++import static org.lwjgl.opengl.GL33C.*;
++
++/** Separate depth attachment; shares scene color only for the final label composition. */
++final class SelectiveDepth
++{
++    static final SelectiveDepth INSTANCE = new SelectiveDepth();
++    private int fbo, depth, color, width, height, samples;
++    boolean active;
++    private int sceneFramebuffer, sceneDepthUniform;
++    private final ByteBuffer colorMask = BufferUtils.createByteBuffer(4);
++
++    // Core-renderer-only path. Caller guarantees the scene program, GREATER depth
++    // test and full color mask; depthWrite is the original pass's write setting.
++    // This avoids synchronous driver queries for every replayed geometry batch.
++    void replayScene(Runnable draw, boolean depthWrite)
++    {
++        if (!active) { return; }
++        try
++        {
++            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
++            glColorMask(false, false, false, false); glDepthMask(true);
++            if (sceneDepthUniform >= 0) { glUniform1i(sceneDepthUniform, 1); }
++            draw.run();
++        }
++        finally
++        {
++            if (sceneDepthUniform >= 0) { glUniform1i(sceneDepthUniform, 0); }
++            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, sceneFramebuffer);
++            glColorMask(true, true, true, true); glDepthMask(depthWrite);
++        }
++    }
++
++
++    void begin(boolean enabled)
++    {
++        active = false;
++        if (!enabled) { return; }
++        int previous = glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING);
++        sceneFramebuffer = previous;
++        int sceneProgram = glGetInteger(GL_CURRENT_PROGRAM);
++        sceneDepthUniform = sceneProgram == 0 ? -1 : glGetUniformLocation(sceneProgram, "testLabelDepth");
++        int renderbuffer = glGetInteger(GL_RENDERBUFFER_BINDING);
++        boolean write = glGetBoolean(GL_DEPTH_WRITEMASK);
++        double clear = glGetDouble(GL_DEPTH_CLEAR_VALUE);
++        boolean scissor = glIsEnabled(GL_SCISSOR_TEST);
++        try
++        {
++            int attachment = glGetFramebufferAttachmentParameteri(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME);
++            glBindRenderbuffer(GL_RENDERBUFFER, attachment);
++            int w = glGetRenderbufferParameteri(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH);
++            int h = glGetRenderbufferParameteri(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT);
++            int ms = glGetRenderbufferParameteri(GL_RENDERBUFFER, GL_RENDERBUFFER_SAMPLES);
++            if (fbo == 0 || color != attachment || width != w || height != h || samples != ms)
++            {
++                close();
++                fbo = glGenFramebuffers(); depth = glGenRenderbuffers();
++                color = attachment; width = w; height = h; samples = ms;
++                glBindRenderbuffer(GL_RENDERBUFFER, depth);
++                if (ms > 0) { glRenderbufferStorageMultisample(GL_RENDERBUFFER, ms, GL_DEPTH_COMPONENT32F, w, h); }
++                else { glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT32F, w, h); }
++                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
++                glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, color);
++                glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depth);
++                if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
++                { throw new IllegalStateException("Incomplete TEST selective-depth framebuffer"); }
++            }
++            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
++            glDisable(GL_SCISSOR_TEST); glDepthMask(true); glClearDepth(0);
++            glClear(GL_DEPTH_BUFFER_BIT); // Only our separate depth attachment.
++            active = true;
++        }
++        finally
++        {
++            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, previous); glBindRenderbuffer(GL_RENDERBUFFER, renderbuffer);
++            glDepthMask(write); glClearDepth(clear);
++            if (scissor) { glEnable(GL_SCISSOR_TEST); }
++        }
++    }
++
++    void replay(Runnable draw)
++    {
++        if (!active) { return; }
++        int previous = glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING);
++        boolean write = glGetBoolean(GL_DEPTH_WRITEMASK), test = glIsEnabled(GL_DEPTH_TEST);
++        int func = glGetInteger(GL_DEPTH_FUNC);
++        int program = glGetInteger(GL_CURRENT_PROGRAM);
++        int uniform = program == 0 ? -1 : glGetUniformLocation(program, "testLabelDepth");
++        int previousUniform = uniform < 0 ? 0 : glGetUniformi(program, uniform);
++        ByteBuffer mask = colorMask; mask.clear(); glGetBooleanv(GL_COLOR_WRITEMASK, mask);
++        try
++        {
++            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo);
++            glColorMask(false, false, false, false);
++            glEnable(GL_DEPTH_TEST); glDepthFunc(GL_GREATER); glDepthMask(true);
++            if (uniform >= 0) { glUniform1i(uniform, 1); }
++            draw.run();
++        }
++        finally
++        {
++            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, previous);
++            glColorMask(mask.get(0)!=0, mask.get(1)!=0, mask.get(2)!=0, mask.get(3)!=0);
++            glDepthMask(write); glDepthFunc(func);
++            if (uniform >= 0) { glUniform1i(uniform, previousUniform); }
++            if (!test) { glDisable(GL_DEPTH_TEST); }
++        }
++    }
++
++    void labels(Runnable draw)
++    {
++        if (!active) { return; }
++        int previous = glGetInteger(GL_DRAW_FRAMEBUFFER_BINDING);
++        try { glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo); draw.run(); }
++        finally { glBindFramebuffer(GL_DRAW_FRAMEBUFFER, previous); active = false; }
++    }
++
++    void close()
++    {
++        active = false;
++        if (fbo != 0) { glDeleteFramebuffers(fbo); fbo = 0; }
++        if (depth != 0) { glDeleteRenderbuffers(depth); depth = 0; }
++        color = 0;
++    }
++}
+--- a/runelite-client/src/main/java/net/runelite/client/plugins/gpu/VAO.java
++++ b/runelite-client/src/main/java/net/runelite/client/plugins/gpu/VAO.java
+@@ -82,6 +82,7 @@
+ 	static class Range
+ 	{
+ 		int endpos;
++		int labelId;
+ 		float[] projection;
+ 		byte h, s, l, a;
+ 		byte renderMethod;
+@@ -99,6 +100,10 @@
+ 
+ 	void addRange(float[] projection, Scene scene, int renderMode)
+ 	{
++		addRange(projection, scene, renderMode, LabelOccluders.IGNORE);
++	}
++	void addRange(float[] projection, Scene scene, int renderMode, int labelId)
++	{
+ 		assert vbo.mapped;
+ 
+ 		if (off > 0)
+@@ -110,7 +115,7 @@
+ 				return;
+ 			}
+ 
+-			if (projection == r.projection && renderMode == r.renderMethod)
++			if (projection == r.projection && renderMode == r.renderMethod && labelId == r.labelId)
+ 			{
+ 				assert pos > r.endpos;
+ 				r.endpos = pos;
+@@ -130,6 +135,7 @@
+ 
+ 		Range r = ranges[off++];
+ 		r.endpos = vbo.vb.position();
++		r.labelId = labelId;
+ 		r.projection = projection;
+ 		r.h = scene.getOverrideHue();
+ 		r.s = scene.getOverrideSaturation();
+@@ -178,6 +184,11 @@
+ 				glDrawArrays(GL_TRIANGLES, start / (VERT_SIZE / 4), count / (VERT_SIZE / 4));
+ 			}
+ 
++			if (SelectiveDepth.INSTANCE.active && LabelOccluders.INSTANCE.blocks(range.labelId))
++			{
++				final int firstVertex = start / (VERT_SIZE / 4), vertexCount = count / (VERT_SIZE / 4);
++				SelectiveDepth.INSTANCE.replayScene(() -> glDrawArrays(GL_TRIANGLES, firstVertex, vertexCount), true);
++			}
+ 			start = end;
+ 		}
+ 	}
+--- a/runelite-client/src/main/java/net/runelite/client/plugins/gpu/Zone.java
++++ b/runelite-client/src/main/java/net/runelite/client/plugins/gpu/Zone.java
+@@ -55,6 +55,20 @@
+ 	// index 2: short vec4(id, u, v, 0)
+ 	static final int VERT_SIZE = 20;
+ 
++	private static final IntBuffer labelOffsets = BufferUtils.createIntBuffer(1024);
++    private static final IntBuffer labelCounts = BufferUtils.createIntBuffer(1024);
++    private static void flushLabelRanges()
++    {
++        if (labelOffsets.position() == 0) { return; }
++        labelOffsets.flip(); labelCounts.flip();
++        glMultiDrawArrays(GL_TRIANGLES, labelOffsets, labelCounts);
++        labelOffsets.clear(); labelCounts.clear();
++    }
++    final List<int[]> labelRanges = new ArrayList<>();
++	void labelRange(int start, int end, int id)
++	{
++		if (end > start) { labelRanges.add(new int[]{start / (VERT_SIZE / 4), end / (VERT_SIZE / 4), id}); }
++	}
+ 	int glVao;
+ 	int bufLen;
+ 
+@@ -126,6 +140,7 @@
+ 		// don't add permanent alphamodels to the cache as permanent alphamodels are always allocated
+ 		// to avoid having to synchronize the cache
+ 		alphaModels.clear();
++		labelRanges.clear();
+ 	}
+ 
+ 	void unmap()
+@@ -269,6 +284,24 @@
+ 			glUniform3i(uniBase, zx << 10, 0, zz << 10);
+ 			glBindVertexArray(glVao);
+ 			glMultiDrawArrays(GL_TRIANGLES, drawOff, drawEnd);
++			SelectiveDepth.INSTANCE.replayScene(() -> {
++                labelOffsets.clear(); labelCounts.clear();
++				for (int[] range : labelRanges)
++				{
++					if (!LabelOccluders.INSTANCE.blocks(range[2])) { continue; }
++					for (int i = 0; i < drawOff.limit(); i++)
++					{
++						int begin = Math.max(range[0], drawOff.get(i));
++						int end = Math.min(range[1], drawOff.get(i) + drawEnd.get(i));
++						if (end > begin)
++                        {
++                            if (!labelOffsets.hasRemaining()) { flushLabelRanges(); }
++                            labelOffsets.put(begin); labelCounts.put(end - begin);
++                        }
++					}
++				}
++                flushLabelRanges();
++			}, true);
+ 		}
+ 	}
+ 
+@@ -428,7 +461,7 @@
+ 		alphaModels.add(m);
+ 	}
+ 
+-	synchronized void addTempAlphaModel(int vao, int startpos, int endpos, int level, int x, int y, int z)
++	synchronized void addTempAlphaModel(int vao, int startpos, int endpos, int level, int x, int y, int z, int labelId)
+ 	{
+ 		AlphaModel m;
+ 		synchronized (modelCache)
+@@ -439,7 +472,7 @@
+ 		{
+ 			m = new AlphaModel();
+ 		}
+-		m.id = -1;
++		m.id = labelId;
+ 		m.startpos = startpos;
+ 		m.endpos = endpos;
+ 		m.x = (short) x;
+@@ -477,6 +510,7 @@
+ 	private static final int STATIC_UNSORTED = 3;
+ 
+ 	private static int lastDrawMode;
++	private static boolean lastBlocks;
+ 	private static int lastVao;
+ 	private static int lastzx, lastzz;
+ 
+@@ -562,13 +596,14 @@
+ 				continue;
+ 			}
+ 
+-			if (lastVao != m.vao
++			if (lastBlocks != LabelOccluders.INSTANCE.blocks(m.id) || lastVao != m.vao
+ 				|| lastzx != (zx - m.zofx) || lastzz != (zz - m.zofz)
+ 			)
+ 			{
+ 				flush();
+ 			}
+ 
++			lastBlocks = LabelOccluders.INSTANCE.blocks(m.id);
+ 			lastVao = m.vao;
+ 			lastzx = zx - m.zofx;
+ 			lastzz = zz - m.zofz;
+@@ -667,6 +702,7 @@
+ 			glBindVertexArray(lastVao);
+ 			glDepthMask(false);
+ 			glMultiDrawArrays(GL_TRIANGLES, drawOff, drawEnd);
++			if (lastBlocks) { SelectiveDepth.INSTANCE.replayScene(() -> glMultiDrawArrays(GL_TRIANGLES, drawOff, drawEnd), false); }
+ 			glDepthMask(true);
+ 			drawOff.clear();
+ 			drawEnd.clear();
+@@ -680,6 +716,7 @@
+ 			glBufferData(GL_ELEMENT_ARRAY_BUFFER, alphaElements, GL_STREAM_DRAW);
+ 			glDepthMask(false);
+ 			glDrawElements(GL_TRIANGLES, alphaElements.limit(), GL_UNSIGNED_INT, 0L);
++			if (lastBlocks) { SelectiveDepth.INSTANCE.replayScene(() -> glDrawElements(GL_TRIANGLES, alphaElements.limit(), GL_UNSIGNED_INT, 0L), false); }
+ 			glDepthMask(true);
+ 			glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+ 			alphaElements.clear();
+@@ -692,6 +729,7 @@
+ 			glBindVertexArray(lastVao);
+ 			glDepthMask(false);
+ 			glMultiDrawArrays(GL_TRIANGLES, drawOff, drawEnd);
++			if (lastBlocks) { SelectiveDepth.INSTANCE.replayScene(() -> glMultiDrawArrays(GL_TRIANGLES, drawOff, drawEnd), false); }
+ 			glDepthMask(true);
+ 			drawOff.clear();
+ 			drawEnd.clear();
+--- a/runelite-client/src/main/resources/net/runelite/client/plugins/gpu/frag.glsl
++++ b/runelite-client/src/main/resources/net/runelite/client/plugins/gpu/frag.glsl
+@@ -60,6 +60,8 @@
+ }
+ #endif
+ 
++uniform int testLabelDepth;
++
+ void main() {
+   vec4 c;
+ 
+@@ -93,6 +95,7 @@
+ 
+   vec3 mixedColor = mix(c.rgb, fogColor.rgb, fFogAmount);
+   FragColor = vec4(mixedColor, c.a);
++  if (testLabelDepth != 0 && c.a < 0.01) discard;
+ 
+ #ifdef FRAG_UVS
+   if (fTextureId > 0) {
